@@ -1,1 +1,1 @@
-FROM ghcr.io/xiewei3536/codex-reg-mailfree-hg:latest1
+FROM ghcr.io/xiewei3536/codex-reg-mailfree-hg:latest
