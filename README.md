@@ -1,8 +1,8 @@
- ---
-  title: cr
-  emoji: 📟
-  colorFrom: blue
-  colorTo: indigo
-  sdk: docker
-  app_port: 7860
-  ---
+---
+title: cr
+emoji: 📟
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+--- 
