@@ -77,6 +77,7 @@ fi
 cpa_pid=""
 cpamp_pid=""
 nginx_pid=""
+snapshot_pid=""
 shutting_down=0
 
 shutdown_services() {
@@ -85,9 +86,12 @@ shutdown_services() {
   fi
   shutting_down=1
 
-  echo "Stopping nginx, CPA Manager Plus and CLIProxyAPI..."
+  echo "Stopping nginx, snapshot worker, CPA Manager Plus and CLIProxyAPI..."
   if [ -n "${nginx_pid}" ]; then
     kill -QUIT "${nginx_pid}" 2>/dev/null || true
+  fi
+  if [ -n "${snapshot_pid}" ]; then
+    kill -TERM "${snapshot_pid}" 2>/dev/null || true
   fi
   if [ -n "${cpamp_pid}" ]; then
     kill -TERM "${cpamp_pid}" 2>/dev/null || true
@@ -99,7 +103,7 @@ shutdown_services() {
   shutdown_attempts=0
   while [ "${shutdown_attempts}" -lt 100 ]; do
     any_running=0
-    for service_pid in "${nginx_pid}" "${cpamp_pid}" "${cpa_pid}"; do
+    for service_pid in "${nginx_pid}" "${snapshot_pid}" "${cpamp_pid}" "${cpa_pid}"; do
       if [ -n "${service_pid}" ] && kill -0 "${service_pid}" 2>/dev/null; then
         any_running=1
       fi
@@ -111,7 +115,7 @@ shutdown_services() {
     sleep 0.1
   done
 
-  for service_pid in "${nginx_pid}" "${cpamp_pid}" "${cpa_pid}"; do
+  for service_pid in "${nginx_pid}" "${snapshot_pid}" "${cpamp_pid}" "${cpa_pid}"; do
     if [ -n "${service_pid}" ] && kill -0 "${service_pid}" 2>/dev/null; then
       kill -KILL "${service_pid}" 2>/dev/null || true
     fi
@@ -120,15 +124,33 @@ shutdown_services() {
   if [ -n "${nginx_pid}" ]; then
     wait "${nginx_pid}" 2>/dev/null || true
   fi
+  if [ -n "${snapshot_pid}" ]; then
+    wait "${snapshot_pid}" 2>/dev/null || true
+  fi
   if [ -n "${cpamp_pid}" ]; then
     wait "${cpamp_pid}" 2>/dev/null || true
   fi
   if [ -n "${cpa_pid}" ]; then
     wait "${cpa_pid}" 2>/dev/null || true
   fi
+
+  if [ -f "${USAGE_DB_PATH}" ]; then
+    echo "Uploading final consistent SQLite snapshot..."
+    if ! /usr/local/bin/snapshot-manager.py backup --force; then
+      echo "Final SQLite snapshot upload failed" >&2
+      return 1
+    fi
+  fi
 }
 
-trap 'shutdown_services; exit 0' INT TERM
+on_signal() {
+  if shutdown_services; then
+    exit 0
+  fi
+  exit 1
+}
+
+trap 'on_signal' INT TERM
 
 wait_for_service() {
   service_name="$1"
@@ -153,10 +175,13 @@ wait_for_service() {
   return 1
 }
 
-/usr/local/bin/CLIProxyAPI -config "${CPA_CONFIG}" &
+mkdir -p "$(dirname "${USAGE_DB_PATH}")"
+/usr/local/bin/snapshot-manager.py restore
+
+env -u HF_TOKEN /usr/local/bin/CLIProxyAPI -config "${CPA_CONFIG}" &
 cpa_pid=$!
 
-/usr/local/bin/cpa-manager-plus &
+env -u HF_TOKEN /usr/local/bin/cpa-manager-plus &
 cpamp_pid=$!
 
 if ! wait_for_service "CLIProxyAPI" "http://127.0.0.1:8317/healthz" "${cpa_pid}"; then
@@ -169,14 +194,19 @@ if ! wait_for_service "CPA Manager Plus" "http://127.0.0.1:18317/health" "${cpam
   exit 1
 fi
 
+/usr/local/bin/snapshot-manager.py watch \
+  --interval "${CPAMP_SNAPSHOT_INTERVAL_SECONDS:-120}" &
+snapshot_pid=$!
+
 nginx -t
-nginx -g 'daemon off;' &
+env -u HF_TOKEN nginx -g 'daemon off;' &
 nginx_pid=$!
 
 echo "Integrated CPA gateway and manager are ready on port 7860"
 
 while kill -0 "${cpa_pid}" 2>/dev/null \
   && kill -0 "${cpamp_pid}" 2>/dev/null \
+  && kill -0 "${snapshot_pid}" 2>/dev/null \
   && kill -0 "${nginx_pid}" 2>/dev/null; do
   sleep 2
 done

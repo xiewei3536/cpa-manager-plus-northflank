@@ -21,8 +21,12 @@ Nginx exposes the management panel at `/management.html` and routes model API
 traffic such as `/v1/*` and `/v1beta/*` directly to CPA. CPA Manager Plus uses
 the internal CPA endpoint at `http://127.0.0.1:8317`.
 
-All runtime data is stored under `/data`, backed by the private
-`04191bw88tk/cr-data` Storage Bucket mounted as a read-write Space volume.
-CPA configuration, provider credentials, plugins, SQLite data and encryption
-keys therefore survive Space restarts. Credentials are configured as Hugging
-Face Space secrets and are not committed to this repository.
+The private `04191bw88tk/cr-data` Storage Bucket is mounted read-write at
+`/data`. CPA configuration, provider credentials, plugins and encryption keys
+are stored there directly. The Manager SQLite database runs on local disk to
+avoid object-mount random-I/O limitations; a supervisor creates verified,
+consistent SQLite snapshots, uploads immutable generations to the private
+bucket and restores the newest generation during every startup. A final
+snapshot is uploaded during graceful shutdown, so normal Space restarts retain
+all committed Manager data. Credentials are configured as Hugging Face Space
+secrets and are not committed to this repository.
