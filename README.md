@@ -1,32 +1,75 @@
----
-title: CPA Manager Plus
-emoji: 📊
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_port: 7860
-fullWidth: true
-header: mini
-license: mit
----
+# CPA + CPA Manager Plus on Northflank
 
-# CPA + CPA Manager Plus
+Single-container deployment of:
 
-This Space runs an integrated, pinned deployment of:
+- CLIProxyAPI `v7.2.99`
+- CPA Manager Plus `v1.11.7`
+- Nginx on port `7860`
 
-- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) v7.2.99
-- [CPA Manager Plus](https://github.com/seakee/CPA-Manager-Plus) v1.11.7
+## Northflank settings
 
-Nginx exposes the management panel at `/management.html` and routes model API
-traffic such as `/v1/*` and `/v1beta/*` directly to CPA. CPA Manager Plus uses
-the internal CPA endpoint at `http://127.0.0.1:8317`.
+Create a **Combined Service** from this branch and use:
 
-The private `04191bw88tk/cr-data` Storage Bucket is mounted read-write at
-`/data`. CPA configuration, provider credentials, plugins and encryption keys
-are stored there directly. The Manager SQLite database runs on local disk to
-avoid object-mount random-I/O limitations; a supervisor creates verified,
-consistent SQLite snapshots, uploads immutable generations to the private
-bucket and restores the newest generation during every startup. A final
-snapshot is uploaded during graceful shutdown, so normal Space restarts retain
-all committed Manager data. Credentials are configured as Hugging Face Space
-secrets and are not committed to this repository.
+| Setting | Value |
+| --- | --- |
+| Build type | Dockerfile / BuildKit |
+| Dockerfile | `/Dockerfile` |
+| Build context | `/` |
+| Public port | HTTP `7860` |
+| Instances | `1` |
+| Autoscaling | Off |
+| Grace period | `60` seconds |
+| Startup/readiness probe | HTTP `7860 /health` |
+| Liveness probe | HTTP `7860 /healthz` |
+
+Create a **Single Read/Write** persistent volume and mount it at `/data`.
+The volume holds:
+
+```text
+/data/cpa/                 CPA configuration, credentials and plugins
+/data/cpamp/usage.sqlite   Manager database
+/data/cpamp/data.key       Manager encryption key
+```
+
+Northflank stops the old instance before attaching a Single Read/Write volume
+to the replacement instance, so SQLite data survives restarts and deployments.
+Keep the service at exactly one instance.
+
+## Secrets
+
+The shortest setup uses one Northflank secret:
+
+```env
+STACK_PASSWORD=<administrator-and-default-API-key>
+```
+
+For separate credentials, omit `STACK_PASSWORD` and set all three:
+
+```env
+CPA_MANAGER_ADMIN_KEY=<manager-login-key>
+CPA_MANAGEMENT_KEY=<internal-CPA-management-key>
+CPA_GATEWAY_API_KEY=<model-API-key>
+```
+
+`CPA_MANAGER_DATA_KEY` is optional for a new persistent volume. When omitted,
+CPA Manager Plus creates `/data/cpamp/data.key` once and reuses it thereafter.
+
+## Routes
+
+- `/management.html` — CPA Manager Plus
+- `/v1/*`, `/v1beta/*`, `/api/*` — CLIProxyAPI
+- `/health` — Manager health
+- `/healthz` — CPA health
+
+## Migrating existing data
+
+Stop the source service, then copy the verified files before starting this
+service for the first time:
+
+```text
+usage.sqlite  -> /data/cpamp/usage.sqlite
+data.key      -> /data/cpamp/data.key
+cpa/*         -> /data/cpa/*
+```
+
+The database and `data.key` must be migrated together.
