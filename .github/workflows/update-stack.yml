@@ -374,8 +374,7 @@ jobs:
           request="$(jq -cn \
             --arg bundleUrl "$BUNDLE_URL" \
             --arg branch main \
-            --arg sha "$COMMIT_SHA" \
-            '{bundleUrl: $bundleUrl, branch: $branch, sha: $sha}')"
+            '{bundleUrl: $bundleUrl, branch: $branch}')"
 
           # Do not automatically retry this POST: an ambiguous network failure
           # could otherwise start duplicate builds.
