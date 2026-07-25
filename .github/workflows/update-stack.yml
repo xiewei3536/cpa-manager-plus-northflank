@@ -343,6 +343,7 @@ jobs:
       NORTHFLANK_SERVICE_ID: cpa-stack
     steps:
       - name: Validate Northflank service
+        id: validate
         run: |
           set -Eeuo pipefail
           if [[ -z "$NORTHFLANK_API_TOKEN" ]]; then
@@ -367,14 +368,36 @@ jobs:
             exit 1
           }
 
-      - name: Start and monitor Northflank build
-        id: build
+          previous_bundle_url="$(jq -er '.data.bundleData.bundleUrl | select(type == "string" and length > 0)' <<<"$service")"
+          echo "previous_bundle_url=${previous_bundle_url}" >>"$GITHUB_OUTPUT"
+
+      - name: Set the bundle as the service build source
         run: |
           set -Eeuo pipefail
           request="$(jq -cn \
             --arg bundleUrl "$BUNDLE_URL" \
-            --arg branch main \
-            '{bundleUrl: $bundleUrl, branch: $branch}')"
+            '{
+              buildSource: "bundle",
+              disabledCI: true,
+              bundleData: {bundleUrl: $bundleUrl, branch: "main"}
+            }')"
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-all-errors \
+            --request PATCH \
+            --header 'Content-Type: application/json' \
+            --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
+            --data "$request" \
+            "${NORTHFLANK_API_URL}/services/combined/${NORTHFLANK_SERVICE_ID}" \
+            >/dev/null
+
+      - name: Start and monitor Northflank build
+        id: build
+        run: |
+          set -Eeuo pipefail
 
           # Do not automatically retry this POST: an ambiguous network failure
           # could otherwise start duplicate builds.
@@ -385,7 +408,7 @@ jobs:
             --request POST \
             --header 'Content-Type: application/json' \
             --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
-            --data "$request" \
+            --data '{}' \
             "${NORTHFLANK_API_URL}/services/${NORTHFLANK_SERVICE_ID}/build")"
           build_id="$(jq -er '.data.id | select(type == "string" and length > 0)' <<<"$response")"
           echo "build_id=${build_id}" >>"$GITHUB_OUTPUT"
@@ -420,32 +443,6 @@ jobs:
             echo "::error::Timed out waiting for Northflank build ${build_id}"
             exit 1
           fi
-
-      - name: Save the bundle as the service build source
-        env:
-          BUILD_ID: ${{ steps.build.outputs.build_id }}
-        run: |
-          set -Eeuo pipefail
-          request="$(jq -cn \
-            --arg bundleUrl "$BUNDLE_URL" \
-            '{
-              buildSource: "bundle",
-              disabledCI: true,
-              bundleData: {bundleUrl: $bundleUrl, branch: "main"}
-            }')"
-          curl \
-            --fail-with-body \
-            --silent \
-            --show-error \
-            --retry 5 \
-            --retry-all-errors \
-            --request PATCH \
-            --header 'Content-Type: application/json' \
-            --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
-            --data "$request" \
-            "${NORTHFLANK_API_URL}/services/combined/${NORTHFLANK_SERVICE_ID}" \
-            >/dev/null
-          echo "Saved immutable bundle URL for build ${BUILD_ID}."
 
       - name: Wait for deployment and verify health
         env:
@@ -528,3 +525,30 @@ jobs:
             echo "- Status: deployed and healthy"
             echo "- Service: ${base_url}"
           } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Restore previous build source after failure
+        if: ${{ failure() && steps.validate.outputs.previous_bundle_url != '' }}
+        env:
+          PREVIOUS_BUNDLE_URL: ${{ steps.validate.outputs.previous_bundle_url }}
+        run: |
+          set -Eeuo pipefail
+          request="$(jq -cn \
+            --arg bundleUrl "$PREVIOUS_BUNDLE_URL" \
+            '{
+              buildSource: "bundle",
+              disabledCI: true,
+              bundleData: {bundleUrl: $bundleUrl, branch: "main"}
+            }')"
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-all-errors \
+            --request PATCH \
+            --header 'Content-Type: application/json' \
+            --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
+            --data "$request" \
+            "${NORTHFLANK_API_URL}/services/combined/${NORTHFLANK_SERVICE_ID}" \
+            >/dev/null
+          echo "Restored the previous Northflank bundle source."
