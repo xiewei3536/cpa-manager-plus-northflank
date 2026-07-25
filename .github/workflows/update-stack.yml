@@ -6,12 +6,14 @@ on:
   workflow_dispatch:
     inputs:
       cpa_tag:
-        description: "CPA image tag（留空則沿用目前版本，例如 v7.2.99）"
+        description: "CPA image tag（auto／留空＝自動選最新穩定版）"
         required: false
+        default: auto
         type: string
       plus_tag:
-        description: "CPA Manager Plus image tag（留空則沿用目前版本，例如 v1.11.7）"
+        description: "CPA Manager Plus image tag（auto／留空＝自動選最新穩定版）"
         required: false
+        default: auto
         type: string
       deploy:
         description: "Commit 後立即建置並部署到 Northflank"
@@ -67,12 +69,23 @@ jobs:
         run: |
           set -Eeuo pipefail
           python3 <<'PY'
+          import json
           import os
           import re
+          import time
           from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlsplit
+          from urllib.request import Request, urlopen
 
           dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
           tag_pattern = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+          stable_pattern = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+          user_agent = "cpa-manager-plus-northflank/update-stack (GitHub Actions)"
+          repositories = {
+              "cpa": "eceasy/cli-proxy-api",
+              "plus": "seakee/cpa-manager-plus",
+          }
           image_lines = {
               "cpa": re.compile(
                   rf"^FROM eceasy/cli-proxy-api:(?P<tag>{tag_pattern})"
@@ -86,18 +99,100 @@ jobs:
               ),
           }
 
+          def get_json(url, repository):
+              expected_path = f"/v2/repositories/{repository}/tags"
+              parsed = urlsplit(url)
+              if (
+                  parsed.scheme != "https"
+                  or parsed.netloc != "hub.docker.com"
+                  or parsed.path != expected_path
+                  or parsed.fragment
+              ):
+                  raise SystemExit(f"Docker Hub returned an invalid pagination URL for {repository}")
+
+              last_error = None
+              for attempt in range(1, 5):
+                  request = Request(
+                      url,
+                      headers={
+                          "Accept": "application/json",
+                          "User-Agent": user_agent,
+                      },
+                  )
+                  try:
+                      with urlopen(request, timeout=20) as response:
+                          if response.status != 200:
+                              raise RuntimeError(f"unexpected HTTP status {response.status}")
+                          body = response.read(4 * 1024 * 1024 + 1)
+                      if len(body) > 4 * 1024 * 1024:
+                          raise RuntimeError("response exceeds 4 MiB")
+                      value = json.loads(body.decode("utf-8"))
+                      if not isinstance(value, dict):
+                          raise RuntimeError("response root is not an object")
+                      return value
+                  except HTTPError as error:
+                      last_error = error
+                      if error.code != 429 and not 500 <= error.code <= 599:
+                          break
+                  except (URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as error:
+                      last_error = error
+
+                  if attempt < 4:
+                      time.sleep(2 ** (attempt - 1))
+
+              raise SystemExit(f"Failed to query Docker Hub for {repository}: {last_error}")
+
+          def latest_stable_tag(repository):
+              url = f"https://hub.docker.com/v2/repositories/{repository}/tags?page=1&page_size=100"
+              seen_urls = set()
+              versions = []
+
+              for _ in range(100):
+                  if url in seen_urls:
+                      raise SystemExit(f"Docker Hub pagination loop for {repository}")
+                  seen_urls.add(url)
+                  page = get_json(url, repository)
+
+                  results = page.get("results")
+                  if not isinstance(results, list):
+                      raise SystemExit(f"Docker Hub returned invalid tag results for {repository}")
+                  for item in results:
+                      if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                          raise SystemExit(f"Docker Hub returned an invalid tag entry for {repository}")
+                      match = stable_pattern.fullmatch(item["name"])
+                      if match:
+                          versions.append((tuple(map(int, match.groups())), item["name"]))
+
+                  next_url = page.get("next")
+                  if next_url is None:
+                      break
+                  if not isinstance(next_url, str) or not next_url:
+                      raise SystemExit(f"Docker Hub returned invalid pagination data for {repository}")
+                  url = next_url
+              else:
+                  raise SystemExit(f"Docker Hub pagination exceeded 100 pages for {repository}")
+
+              if not versions:
+                  raise SystemExit(f"No stable vX.Y.Z tag exists for {repository}")
+              selected = max(versions)[1]
+              if stable_pattern.fullmatch(selected) is None:
+                  raise SystemExit(f"Resolved an invalid stable tag for {repository}: {selected!r}")
+              return selected
+
           selected = {}
           for name, pattern in image_lines.items():
               matches = list(pattern.finditer(dockerfile))
               if len(matches) != 1:
                   raise SystemExit(f"Dockerfile must contain exactly one pinned {name} FROM line")
-              requested = os.environ[f"INPUT_{name.upper()}_TAG"]
-              if requested:
+              requested = os.environ[f"INPUT_{name.upper()}_TAG"].strip()
+              if not requested or requested.lower() == "auto":
+                  selected[name] = latest_stable_tag(repositories[name])
+              else:
                   if re.fullmatch(tag_pattern, requested) is None:
                       raise SystemExit(f"Invalid {name} tag: {requested!r}")
                   selected[name] = requested
-              else:
-                  selected[name] = matches[0].group("tag")
+
+              print(f"Selected {name} tag: {selected[name]}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"cpa_tag={selected['cpa']}\n")

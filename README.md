@@ -8,6 +8,16 @@ One container provides:
 - verified off-instance persistence in the private Hugging Face Bucket
   `04191bw88tk/cr-data`
 
+## 一鍵更新 CPA 與 Plus
+
+1. 到 GitHub 專案的 **Actions → Update CPA stack → Run workflow**。
+2. `cpa_tag` 與 `plus_tag` 保持 `auto`，並勾選 `deploy`。
+3. 按下 **Run workflow**；系統會分別選取 Docker Hub 最新的穩定
+   `vX.Y.Z` 版本、固定映像 digest、更新兩個元件並部署到 Northflank。
+
+若只想指定其中一個版本，在相應欄位填入完整 tag（例如 `v7.2.99`），
+另一欄保留 `auto` 即可。更新不會清除 Bucket 中的既有資料。
+
 The free service does **not** need a Northflank volume. Runtime state stays on
 the container's local filesystem for SQLite compatibility, while immutable
 generations are uploaded to the Bucket every 60 seconds and on graceful
