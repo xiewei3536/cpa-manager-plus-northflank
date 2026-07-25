@@ -196,17 +196,17 @@ jobs:
           test -s "$file_list"
 
           tar \
-            --null \
-            --files-from="$file_list" \
-            --no-recursion \
+            --create \
+            --file="$tar_file" \
+            --format=ustar \
             --sort=name \
             --mtime='UTC 2020-01-01' \
             --owner=0 \
             --group=0 \
             --numeric-owner \
-            --format=ustar \
-            --create \
-            --file="$tar_file"
+            --no-recursion \
+            --null \
+            --files-from="$file_list"
           gzip -9 -n <"$tar_file" >"$gzip_file"
           mv -- "$gzip_file" northflank-bundle.tar.gz
 
