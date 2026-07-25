@@ -4,24 +4,34 @@ FROM seakee/cpa-manager-plus:v1.11.7@sha256:a4ae26a1160b61749aee4537d50edd763ff6
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl nginx tini tzdata \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl nginx python3 python3-pip tini tzdata \
+    && pip3 install --break-system-packages --no-cache-dir huggingface_hub==1.24.0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=cpa /CLIProxyAPI/CLIProxyAPI /usr/local/bin/CLIProxyAPI
 COPY --from=cpamp /usr/local/bin/cpa-manager-plus /usr/local/bin/cpa-manager-plus
 COPY nginx.conf /etc/nginx/nginx.conf
+COPY state-manager.py /usr/local/bin/state-manager.py
 COPY start-services.sh /usr/local/bin/start-services.sh
 
 RUN chmod 0755 /usr/local/bin/CLIProxyAPI \
     /usr/local/bin/cpa-manager-plus \
+    /usr/local/bin/state-manager.py \
     /usr/local/bin/start-services.sh
 
 ENV HTTP_ADDR=127.0.0.1:18317 \
     CPA_DATA_DIR=/data/cpa \
+    CPA_CONFIG=/data/cpa/config.yaml \
     USAGE_DATA_DIR=/data/cpamp \
     USAGE_DB_PATH=/data/cpamp/usage.sqlite \
     CPA_MANAGER_DATA_KEY_PATH=/data/cpamp/data.key \
     CPA_UPSTREAM_URL=http://127.0.0.1:8317 \
+    STATE_BUCKET=04191bw88tk/cr-data \
+    STATE_SNAPSHOT_PREFIX=northflank-state \
+    STATE_SNAPSHOT_INTERVAL_SECONDS=60 \
+    STATE_SNAPSHOT_KEEP=12 \
+    STATE_VERIFY_UPLOAD=true \
+    STATE_REQUIRE_EXISTING=true \
     USAGE_COLLECTOR_MODE=auto \
     USAGE_RESP_QUEUE=usage \
     USAGE_RESP_POP_SIDE=right \
@@ -30,6 +40,7 @@ ENV HTTP_ADDR=127.0.0.1:18317 \
     USAGE_QUERY_LIMIT=50000 \
     USAGE_CORS_ORIGINS=* \
     HOME=/data/cpa/home \
+    HF_HUB_DISABLE_TELEMETRY=1 \
     TZ=Asia/Taipei
 
 EXPOSE 7860

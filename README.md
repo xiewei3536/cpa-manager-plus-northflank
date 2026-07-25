@@ -1,14 +1,24 @@
-# CPA + CPA Manager Plus on Northflank
+# CPA + CPA Manager Plus on Northflank Free
 
-Single-container deployment of:
+One container provides:
 
 - CLIProxyAPI `v7.2.99`
 - CPA Manager Plus `v1.11.7`
-- Nginx on port `7860`
+- Nginx on public port `7860`
+- verified off-instance persistence in the private Hugging Face Bucket
+  `04191bw88tk/cr-data`
 
-## Northflank settings
+The free service does **not** need a Northflank volume. Runtime state stays on
+the container's local filesystem for SQLite compatibility, while immutable
+generations are uploaded to the Bucket every 60 seconds and on graceful
+shutdown. Startup tries generations newest-first and automatically falls back
+when a checksum, archive manifest, `data.key`, required database schema, or
+SQLite integrity check fails. Restore is fail-closed by default: Bucket API
+authorization/network failures and missing prior state stop startup.
 
-Create a **Combined Service** from this branch and use:
+## Northflank service settings
+
+Create one **Combined Service** from this repository/branch:
 
 | Setting | Value |
 | --- | --- |
@@ -16,34 +26,31 @@ Create a **Combined Service** from this branch and use:
 | Dockerfile | `/Dockerfile` |
 | Build context | `/` |
 | Public port | HTTP `7860` |
-| Instances | `1` |
+| Instances | exactly `1` |
 | Autoscaling | Off |
-| Grace period | `60` seconds |
+| Grace period | `90` seconds |
 | Startup/readiness probe | HTTP `7860 /health` |
 | Liveness probe | HTTP `7860 /healthz` |
 
-Create a **Single Read/Write** persistent volume and mount it at `/data`.
-The volume holds:
+Do not create or mount a volume. Do not run two instances: each instance would
+have an independent SQLite writer and generation timeline.
 
-```text
-/data/cpa/                 CPA configuration, credentials and plugins
-/data/cpamp/usage.sqlite   Manager database
-/data/cpamp/data.key       Manager encryption key
-```
+The 256 MB service does not keep Python resident. A lightweight shell timer
+starts the Python backup process only for each snapshot and exits it afterward.
 
-Northflank stops the old instance before attaching a Single Read/Write volume
-to the replacement instance, so SQLite data survives restarts and deployments.
-Keep the service at exactly one instance.
+## Required Northflank secrets
 
-## Secrets
-
-The shortest setup uses one Northflank secret:
+Add these under **Environment → Secrets**:
 
 ```env
-STACK_PASSWORD=<administrator-and-default-API-key>
+HF_TOKEN=<Hugging-Face-token-with-write-access-to-04191bw88tk/cr-data>
+STACK_PASSWORD=<administrator-management-and-default-API-key>
 ```
 
-For separate credentials, omit `STACK_PASSWORD` and set all three:
+`HF_TOKEN` is removed from the environments of CLIProxyAPI, CPA Manager Plus,
+and Nginx. It is available only to the short-lived restore/backup process.
+
+To use three different credentials, omit `STACK_PASSWORD` and add:
 
 ```env
 CPA_MANAGER_ADMIN_KEY=<manager-login-key>
@@ -51,8 +58,73 @@ CPA_MANAGEMENT_KEY=<internal-CPA-management-key>
 CPA_GATEWAY_API_KEY=<model-API-key>
 ```
 
-`CPA_MANAGER_DATA_KEY` is optional for a new persistent volume. When omitted,
-CPA Manager Plus creates `/data/cpamp/data.key` once and reuses it thereafter.
+CPA Manager Plus generates `data.key` on the original deployment and every
+subsequent start restores that same file with the database. The initial
+verified generation is published before Nginx begins accepting traffic.
+
+## Persistence layout
+
+Local application paths:
+
+```text
+/data/cpamp/usage.sqlite   Manager database
+/data/cpamp/data.key       Manager encryption key
+/data/cpa/config.yaml      CPA configuration
+/data/cpa/management.key   CPA management-key continuity check
+/data/cpa/auths/           CPA provider credentials
+/data/cpa/home/            CPA runtime credential state
+/data/cpa/plugins/         CPA plugins
+```
+
+Each Bucket object has this content-addressed form:
+
+```text
+northflank-state/state-<UTC timestamp>-<archive SHA-256>.tar.gz
+```
+
+The archive also contains a manifest with every file's size and SHA-256. A
+SQLite online backup is used for live generations, followed by
+`PRAGMA integrity_check`. Uploads are downloaded and verified before being
+marked successful. Twelve generations are retained by default.
+
+The startup importer also understands the previous HF Space layout:
+
+```text
+cpamp-snapshots/usage-*.sqlite
+data.key
+cpa/config.yaml
+cpa/management.key
+cpa/auths/**
+cpa/home/**
+cpa/plugins/**
+```
+
+After a legacy import, the service immediately publishes the first unified
+generation.
+
+## Optional environment tuning
+
+```env
+STATE_BUCKET=04191bw88tk/cr-data
+STATE_SNAPSHOT_PREFIX=northflank-state
+STATE_SNAPSHOT_INTERVAL_SECONDS=60
+STATE_SNAPSHOT_KEEP=12
+STATE_VERIFY_UPLOAD=true
+STATE_REQUIRE_EXISTING=true
+```
+
+Keep `STATE_VERIFY_UPLOAD=true` for full upload checksum verification. Clean
+deployments and restarts receive a final post-shutdown generation; an abrupt
+container kill restores the newest already-verified periodic generation.
+`STATE_REQUIRE_EXISTING=true` prevents an API outage or incomplete migration
+from being mistaken for a new empty deployment. For a genuinely empty Bucket,
+set it to `false` only for the first successful startup, then restore it to
+`true`.
+
+Restore also enforces bounded archive/member/file/manifest/path sizes, rejects
+non-canonical remote and tar paths, extracts with fixed private permissions,
+and requires the Manager database to contain both `settings` and
+`usage_events`. Backups use an exclusive Linux `flock`.
 
 ## Routes
 
@@ -60,16 +132,3 @@ CPA Manager Plus creates `/data/cpamp/data.key` once and reuses it thereafter.
 - `/v1/*`, `/v1beta/*`, `/api/*` — CLIProxyAPI
 - `/health` — Manager health
 - `/healthz` — CPA health
-
-## Migrating existing data
-
-Stop the source service, then copy the verified files before starting this
-service for the first time:
-
-```text
-usage.sqlite  -> /data/cpamp/usage.sqlite
-data.key      -> /data/cpamp/data.key
-cpa/*         -> /data/cpa/*
-```
-
-The database and `data.key` must be migrated together.
