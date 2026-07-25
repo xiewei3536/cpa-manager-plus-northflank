@@ -1,0 +1,531 @@
+name: Update CPA stack
+
+run-name: Update CPA stack by @${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      cpa_tag:
+        description: "CPA image tag（留空則沿用目前版本，例如 v7.2.99）"
+        required: false
+        type: string
+      plus_tag:
+        description: "CPA Manager Plus image tag（留空則沿用目前版本，例如 v1.11.7）"
+        required: false
+        type: string
+      deploy:
+        description: "Commit 後立即建置並部署到 Northflank"
+        required: true
+        default: true
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: update-cpa-stack
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  update-source:
+    name: Pin images and publish bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      bundle_sha256: ${{ steps.publish.outputs.bundle_sha256 }}
+      bundle_url: ${{ steps.publish.outputs.bundle_url }}
+      commit_sha: ${{ steps.publish.outputs.commit_sha }}
+      cpa_digest: ${{ steps.resolve.outputs.cpa_digest }}
+      cpa_tag: ${{ steps.versions.outputs.cpa_tag }}
+      plus_digest: ${{ steps.resolve.outputs.plus_digest }}
+      plus_tag: ${{ steps.versions.outputs.plus_tag }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          lfs: false
+          ref: main
+
+      - name: Enable Git LFS
+        run: |
+          set -Eeuo pipefail
+          git lfs version
+          git lfs install --local
+          test "$(git check-attr filter -- northflank-bundle.tar.gz | awk '{print $3}')" = "lfs"
+
+      - name: Select and validate image tags
+        id: versions
+        env:
+          INPUT_CPA_TAG: ${{ inputs.cpa_tag }}
+          INPUT_PLUS_TAG: ${{ inputs.plus_tag }}
+        run: |
+          set -Eeuo pipefail
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+          tag_pattern = r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+          image_lines = {
+              "cpa": re.compile(
+                  rf"^FROM eceasy/cli-proxy-api:(?P<tag>{tag_pattern})"
+                  r"@sha256:[0-9a-f]{64} AS cpa$",
+                  re.MULTILINE,
+              ),
+              "plus": re.compile(
+                  rf"^FROM seakee/cpa-manager-plus:(?P<tag>{tag_pattern})"
+                  r"@sha256:[0-9a-f]{64} AS cpamp$",
+                  re.MULTILINE,
+              ),
+          }
+
+          selected = {}
+          for name, pattern in image_lines.items():
+              matches = list(pattern.finditer(dockerfile))
+              if len(matches) != 1:
+                  raise SystemExit(f"Dockerfile must contain exactly one pinned {name} FROM line")
+              requested = os.environ[f"INPUT_{name.upper()}_TAG"]
+              if requested:
+                  if re.fullmatch(tag_pattern, requested) is None:
+                      raise SystemExit(f"Invalid {name} tag: {requested!r}")
+                  selected[name] = requested
+              else:
+                  selected[name] = matches[0].group("tag")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"cpa_tag={selected['cpa']}\n")
+              output.write(f"plus_tag={selected['plus']}\n")
+          PY
+
+      - name: Resolve immutable image digests
+        id: resolve
+        env:
+          CPA_TAG: ${{ steps.versions.outputs.cpa_tag }}
+          PLUS_TAG: ${{ steps.versions.outputs.plus_tag }}
+        run: |
+          set -Eeuo pipefail
+
+          resolve_image() {
+            local output_name="$1"
+            local image="$2"
+            local tag="$3"
+            local reference="${image}:${tag}"
+            local manifest image_config digest
+
+            echo "Resolving ${reference}"
+            manifest="$(docker buildx imagetools inspect "$reference" --format '{{json .Manifest}}')"
+            digest="$(jq -er '.digest | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))' <<<"$manifest")"
+
+            if jq -e '.manifests | type == "array"' >/dev/null 2>&1 <<<"$manifest"; then
+              jq -e 'any(.manifests[]; .platform.os == "linux" and .platform.architecture == "amd64")' \
+                >/dev/null <<<"$manifest" || {
+                  echo "::error::${reference} does not contain a linux/amd64 manifest"
+                  return 1
+                }
+            else
+              image_config="$(docker buildx imagetools inspect "$reference" --format '{{json .Image}}')"
+              jq -e '.os == "linux" and .architecture == "amd64"' >/dev/null <<<"$image_config" || {
+                echo "::error::${reference} is not a linux/amd64 image"
+                return 1
+              }
+            fi
+
+            printf '%s=%s\n' "$output_name" "$digest" >>"$GITHUB_OUTPUT"
+          }
+
+          resolve_image cpa_digest eceasy/cli-proxy-api "$CPA_TAG"
+          resolve_image plus_digest seakee/cpa-manager-plus "$PLUS_TAG"
+
+      - name: Update pinned image references
+        env:
+          CPA_DIGEST: ${{ steps.resolve.outputs.cpa_digest }}
+          CPA_TAG: ${{ steps.versions.outputs.cpa_tag }}
+          PLUS_DIGEST: ${{ steps.resolve.outputs.plus_digest }}
+          PLUS_TAG: ${{ steps.versions.outputs.plus_tag }}
+        run: |
+          set -Eeuo pipefail
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("Dockerfile")
+          dockerfile = path.read_text(encoding="utf-8")
+          replacements = (
+              (
+                  r"^FROM eceasy/cli-proxy-api:[^\s@]+@sha256:[0-9a-f]{64} AS cpa$",
+                  f"FROM eceasy/cli-proxy-api:{os.environ['CPA_TAG']}@{os.environ['CPA_DIGEST']} AS cpa",
+              ),
+              (
+                  r"^FROM seakee/cpa-manager-plus:[^\s@]+@sha256:[0-9a-f]{64} AS cpamp$",
+                  f"FROM seakee/cpa-manager-plus:{os.environ['PLUS_TAG']}@{os.environ['PLUS_DIGEST']} AS cpamp",
+              ),
+          )
+
+          for pattern, replacement in replacements:
+              dockerfile, count = re.subn(pattern, replacement, dockerfile, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"Expected one Dockerfile replacement for {pattern!r}, got {count}")
+
+          path.write_text(dockerfile, encoding="utf-8", newline="\n")
+          PY
+          git diff --check -- Dockerfile
+
+      - name: Create deterministic non-recursive source bundle
+        env:
+          CPA_DIGEST: ${{ steps.resolve.outputs.cpa_digest }}
+          CPA_TAG: ${{ steps.versions.outputs.cpa_tag }}
+          PLUS_DIGEST: ${{ steps.resolve.outputs.plus_digest }}
+          PLUS_TAG: ${{ steps.versions.outputs.plus_tag }}
+        run: |
+          set -Eeuo pipefail
+          file_list="$RUNNER_TEMP/northflank-bundle-files"
+          tar_file="$RUNNER_TEMP/northflank-bundle.tar"
+          gzip_file="$RUNNER_TEMP/northflank-bundle.tar.gz"
+
+          # Only tracked files are bundled. Excluding the output itself prevents
+          # a bundle from ever containing an older bundle recursively.
+          git ls-files -z -- . ':(exclude)northflank-bundle.tar.gz' >"$file_list"
+          test -s "$file_list"
+
+          tar \
+            --null \
+            --files-from="$file_list" \
+            --no-recursion \
+            --sort=name \
+            --mtime='UTC 2020-01-01' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --format=ustar \
+            --create \
+            --file="$tar_file"
+          gzip -9 -n <"$tar_file" >"$gzip_file"
+          mv -- "$gzip_file" northflank-bundle.tar.gz
+
+          gzip -t northflank-bundle.tar.gz
+          if tar -tzf northflank-bundle.tar.gz | grep -Fxq 'northflank-bundle.tar.gz'; then
+            echo "::error::The generated bundle contains itself"
+            exit 1
+          fi
+          tar -xOf northflank-bundle.tar.gz Dockerfile \
+            | grep -Fxq "FROM eceasy/cli-proxy-api:${CPA_TAG}@${CPA_DIGEST} AS cpa"
+          tar -xOf northflank-bundle.tar.gz Dockerfile \
+            | grep -Fxq "FROM seakee/cpa-manager-plus:${PLUS_TAG}@${PLUS_DIGEST} AS cpamp"
+
+      - name: Commit and push main
+        id: commit
+        env:
+          CPA_TAG: ${{ steps.versions.outputs.cpa_tag }}
+          PLUS_TAG: ${{ steps.versions.outputs.plus_tag }}
+        run: |
+          set -Eeuo pipefail
+          bundle_sha256="$(sha256sum northflank-bundle.tar.gz | awk '{print $1}')"
+          bundle_size="$(stat --format='%s' northflank-bundle.tar.gz)"
+
+          git add -- Dockerfile northflank-bundle.tar.gz
+          git diff --cached --check
+
+          pointer="$(git show :northflank-bundle.tar.gz)"
+          grep -Fxq 'version https://git-lfs.github.com/spec/v1' <<<"$pointer"
+          grep -Fxq "oid sha256:${bundle_sha256}" <<<"$pointer"
+          grep -Fxq "size ${bundle_size}" <<<"$pointer"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git diff --cached --quiet; then
+            echo "No source or bundle change; using the current main commit."
+          else
+            git commit -m "Update CPA ${CPA_TAG} and Manager Plus ${PLUS_TAG}"
+            # Do not force or automatically rebase: a concurrent human push must
+            # fail safely so the workflow can be rerun from the new main tip.
+            git push origin HEAD:main
+          fi
+
+          commit_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags origin main
+          remote_sha="$(git rev-parse origin/main)"
+          if [[ "$remote_sha" != "$commit_sha" ]]; then
+            echo "::error::main advanced concurrently; rerun this workflow from the new tip"
+            exit 1
+          fi
+          {
+            echo "bundle_sha256=${bundle_sha256}"
+            echo "commit_sha=${commit_sha}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Verify the immutable Git LFS download
+        id: publish
+        env:
+          BUNDLE_SHA256: ${{ steps.commit.outputs.bundle_sha256 }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+        run: |
+          set -Eeuo pipefail
+          bundle_url="https://media.githubusercontent.com/media/${GITHUB_REPOSITORY}/${COMMIT_SHA}/northflank-bundle.tar.gz"
+          remote_bundle="$RUNNER_TEMP/northflank-bundle.remote.tar.gz"
+          verified=false
+
+          for attempt in $(seq 1 12); do
+            if curl \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              --connect-timeout 15 \
+              --max-time 90 \
+              --output "$remote_bundle" \
+              "$bundle_url"; then
+              remote_sha256="$(sha256sum "$remote_bundle" | awk '{print $1}')"
+              if [[ "$remote_sha256" == "$BUNDLE_SHA256" ]]; then
+                verified=true
+                break
+              fi
+              echo "Attempt ${attempt}: remote bundle digest has not converged yet."
+            else
+              echo "Attempt ${attempt}: Git LFS object is not available yet."
+            fi
+            sleep 10
+          done
+
+          if [[ "$verified" != true ]]; then
+            echo "::error::The immutable Git LFS download did not match the generated bundle"
+            exit 1
+          fi
+
+          gzip -t "$remote_bundle"
+          {
+            echo "bundle_sha256=${BUNDLE_SHA256}"
+            echo "bundle_url=${bundle_url}"
+            echo "commit_sha=${COMMIT_SHA}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Summarize source update
+        env:
+          BUNDLE_SHA256: ${{ steps.publish.outputs.bundle_sha256 }}
+          BUNDLE_URL: ${{ steps.publish.outputs.bundle_url }}
+          COMMIT_SHA: ${{ steps.publish.outputs.commit_sha }}
+          CPA_DIGEST: ${{ steps.resolve.outputs.cpa_digest }}
+          CPA_TAG: ${{ steps.versions.outputs.cpa_tag }}
+          PLUS_DIGEST: ${{ steps.resolve.outputs.plus_digest }}
+          PLUS_TAG: ${{ steps.versions.outputs.plus_tag }}
+        run: |
+          {
+            echo '## CPA stack source'
+            echo
+            echo "- CPA: \`${CPA_TAG}@${CPA_DIGEST}\`"
+            echo "- CPA Manager Plus: \`${PLUS_TAG}@${PLUS_DIGEST}\`"
+            echo "- Commit: [\`${COMMIT_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA})"
+            echo "- Bundle SHA-256: \`${BUNDLE_SHA256}\`"
+            echo "- Bundle: ${BUNDLE_URL}"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  deploy-northflank:
+    name: Deploy to Northflank
+    if: ${{ inputs.deploy }}
+    needs: update-source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      BUNDLE_URL: ${{ needs.update-source.outputs.bundle_url }}
+      COMMIT_SHA: ${{ needs.update-source.outputs.commit_sha }}
+      NORTHFLANK_API_TOKEN: ${{ secrets.NORTHFLANK_API_TOKEN }}
+      NORTHFLANK_API_URL: https://api.northflank.com/v1/teams/linruizhe8835s-team/projects/cpa-manager-plus
+      NORTHFLANK_SERVICE_ID: cpa-stack
+    steps:
+      - name: Validate Northflank service
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "$NORTHFLANK_API_TOKEN" ]]; then
+            echo "::error::Repository secret NORTHFLANK_API_TOKEN is not configured"
+            exit 1
+          fi
+
+          service="$(curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-all-errors \
+            --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
+            "${NORTHFLANK_API_URL}/services/${NORTHFLANK_SERVICE_ID}")"
+          jq -e '
+            .data.serviceType == "combined"
+            and .data.buildSource == "bundle"
+            and .data.disabledCD == false
+          ' >/dev/null <<<"$service" || {
+            echo "::error::Northflank service is not an auto-deploying combined bundle service"
+            exit 1
+          }
+
+      - name: Start and monitor Northflank build
+        id: build
+        run: |
+          set -Eeuo pipefail
+          request="$(jq -cn \
+            --arg bundleUrl "$BUNDLE_URL" \
+            --arg branch main \
+            --arg sha "$COMMIT_SHA" \
+            '{bundleUrl: $bundleUrl, branch: $branch, sha: $sha}')"
+
+          # Do not automatically retry this POST: an ambiguous network failure
+          # could otherwise start duplicate builds.
+          response="$(curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
+            --data "$request" \
+            "${NORTHFLANK_API_URL}/services/${NORTHFLANK_SERVICE_ID}/build")"
+          build_id="$(jq -er '.data.id | select(type == "string" and length > 0)' <<<"$response")"
+          echo "build_id=${build_id}" >>"$GITHUB_OUTPUT"
+          echo "Northflank build ${build_id} started."
+
+          concluded=false
+          for attempt in $(seq 1 240); do
+            response="$(curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --retry 5 \
+              --retry-all-errors \
+              --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
+              "${NORTHFLANK_API_URL}/services/${NORTHFLANK_SERVICE_ID}/build/${build_id}")"
+            status="$(jq -r '.data.status // "UNKNOWN"' <<<"$response")"
+            echo "Build ${build_id} (poll ${attempt}/240): ${status}"
+
+            if [[ "$(jq -r '.data.concluded // false' <<<"$response")" == true ]]; then
+              concluded=true
+              if [[ "$(jq -r '.data.success // false' <<<"$response")" != true ]]; then
+                message="$(jq -r '.data.message // "Build failed"' <<<"$response")"
+                echo "::error::Northflank build failed: ${message}"
+                exit 1
+              fi
+              break
+            fi
+            sleep 10
+          done
+
+          if [[ "$concluded" != true ]]; then
+            echo "::error::Timed out waiting for Northflank build ${build_id}"
+            exit 1
+          fi
+
+      - name: Save the bundle as the service build source
+        env:
+          BUILD_ID: ${{ steps.build.outputs.build_id }}
+        run: |
+          set -Eeuo pipefail
+          request="$(jq -cn \
+            --arg bundleUrl "$BUNDLE_URL" \
+            '{
+              buildSource: "bundle",
+              disabledCI: true,
+              bundleData: {bundleUrl: $bundleUrl, branch: "main"}
+            }')"
+          curl \
+            --fail-with-body \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-all-errors \
+            --request PATCH \
+            --header 'Content-Type: application/json' \
+            --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
+            --data "$request" \
+            "${NORTHFLANK_API_URL}/services/combined/${NORTHFLANK_SERVICE_ID}" \
+            >/dev/null
+          echo "Saved immutable bundle URL for build ${BUILD_ID}."
+
+      - name: Wait for deployment and verify health
+        env:
+          BUILD_ID: ${{ steps.build.outputs.build_id }}
+        run: |
+          set -Eeuo pipefail
+          deployed=false
+          service=''
+          deployment=''
+
+          for attempt in $(seq 1 180); do
+            service="$(curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --retry 5 \
+              --retry-all-errors \
+              --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
+              "${NORTHFLANK_API_URL}/services/${NORTHFLANK_SERVICE_ID}")"
+            deployment="$(curl \
+              --fail-with-body \
+              --silent \
+              --show-error \
+              --retry 5 \
+              --retry-all-errors \
+              --header "Authorization: Bearer ${NORTHFLANK_API_TOKEN}" \
+              "${NORTHFLANK_API_URL}/services/${NORTHFLANK_SERVICE_ID}/deployment")"
+            deployed_build="$(jq -r '.data.internal.buildId // ""' <<<"$deployment")"
+            deployment_status="$(jq -r '.data.status.deployment.status // "UNKNOWN"' <<<"$service")"
+            echo "Deployment: build=${deployed_build:-pending} status=${deployment_status}"
+
+            if [[ "$deployed_build" == "$BUILD_ID" && "$deployment_status" == 'COMPLETED' ]]; then
+              deployed=true
+              break
+            fi
+            if [[ "$deployed_build" == "$BUILD_ID" && "$deployment_status" =~ ^(FAILED|ERROR|ABORTED)$ ]]; then
+              echo "::error::Northflank deployment failed with status ${deployment_status}"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          if [[ "$deployed" != true ]]; then
+            echo "::error::Timed out waiting for Northflank deployment ${BUILD_ID}"
+            exit 1
+          fi
+
+          saved_bundle_url="$(jq -r '.data.bundleData.bundleUrl // ""' <<<"$service")"
+          if [[ "$saved_bundle_url" != "$BUNDLE_URL" ]]; then
+            echo "::error::Northflank did not retain the immutable bundle URL"
+            exit 1
+          fi
+
+          public_host="$(jq -er '[
+            .data.ports[]
+            | select(.public == true and .protocol == "HTTP")
+            | .dns
+          ][0] | select(type == "string" and length > 0)' <<<"$service")"
+          base_url="https://${public_host}"
+          healthy=false
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --max-time 15 "${base_url}/health" >/dev/null \
+              && curl --fail --silent --show-error --max-time 15 "${base_url}/healthz" >/dev/null; then
+              healthy=true
+              break
+            fi
+            echo "Health check attempt ${attempt} has not passed yet."
+            sleep 10
+          done
+          if [[ "$healthy" != true ]]; then
+            echo "::error::The deployed service did not pass /health and /healthz checks"
+            exit 1
+          fi
+
+          {
+            echo '## Northflank deployment'
+            echo
+            echo "- Build: \`${BUILD_ID}\`"
+            echo "- Commit: \`${COMMIT_SHA}\`"
+            echo "- Status: deployed and healthy"
+            echo "- Service: ${base_url}"
+          } >>"$GITHUB_STEP_SUMMARY"
